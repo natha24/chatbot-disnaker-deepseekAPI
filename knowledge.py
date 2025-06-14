@@ -3,6 +3,17 @@ import os
 
 KNOWLEDGE_FILE = "knowledge.json"
 
+# Di fungsi cari_jawaban()
+def cari_jawaban(pertanyaan):
+    pertanyaan = pertanyaan.lower()
+    
+    # Pertanyaan sangat umum
+    if any(k in pertanyaan for k in ["halo", "hai", "pagi", "siang"]):
+        return "Halo! Ada yang bisa saya bantu seputar layanan DISNAKER Bartim?"
+    
+    if "jam buka" in pertanyaan:
+        return "Jam pelayanan: Senin-Kamis 08.00-14.00 WIB | Jumat 08.00-11.00 WIB"
+
 def load_knowledge():
     """Memuat knowledge base dari file JSON"""
     if not os.path.exists(KNOWLEDGE_FILE):
