@@ -1,16 +1,20 @@
-from flask import Flask, request, jsonify
-import requests
 import os
 import json
 import logging
 import re
+import random
+import time
+import uuid
+import requests
+from flask import Flask, request, jsonify
 from datetime import datetime
 from twilio.rest import Client
-import html
+from queue import Queue
+from threading import Thread
 
 app = Flask(__name__)
 
-# Konfigurasi
+# ===================== KONFIGURASI =====================
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE = "whatsapp:+14155238886"
@@ -18,12 +22,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ADMIN_PHONES = json.loads(os.getenv("ADMIN_PHONES", "[]"))
 SANDBOX_CODE = os.getenv("SANDBOX_CODE", "default-code")
 WEB_SEARCH_API_KEY = os.getenv("WEB_SEARCH_API_KEY")
+MAPS_LOCATION = os.getenv("MAPS_LOCATION", "https://maps.app.goo.gl/XXXXX")
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Inisialisasi klien Twilio
+# ===================== INISIALISASI TWILIO =====================
 try:
     twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     logger.info("Twilio client initialized successfully")
@@ -31,11 +36,55 @@ except Exception as e:
     logger.error(f"Twilio init error: {str(e)}")
     twilio_client = None
 
-# ========== KONFIGURASI DOMAIN ==========
+# ===================== SISTEM ANTRIAN UNTUK PENANGANAN RATE LIMIT =====================
+message_queue = Queue()
+SEND_RETRY_DELAY = 60  # 60 detik antara percobaan pengiriman
+
+def message_sender_worker():
+    """Worker untuk mengirim pesan dengan penanganan rate limit"""
+    while True:
+        try:
+            message_data = message_queue.get()
+            from_number = message_data['to']
+            message_body = message_data['body']
+            attempt = message_data.get('attempt', 0)
+            message_id = message_data.get('id', str(uuid.uuid4()))
+            
+            if attempt > 3:
+                logger.error(f"Gagal mengirim pesan {message_id} setelah 3 percobaan")
+                message_queue.task_done()
+                continue
+                
+            try:
+                twilio_client.messages.create(
+                    body=message_body,
+                    from_=TWILIO_PHONE,
+                    to=f"whatsapp:{from_number}"
+                )
+                logger.info(f"Pesan {message_id} terkirim ke {from_number}")
+            except Exception as e:
+                if "429" in str(e):
+                    logger.warning(f"Rate limit terdeteksi, mencoba lagi dalam {SEND_RETRY_DELAY} detik")
+                    message_data['attempt'] = attempt + 1
+                    message_queue.put(message_data)
+                    time.sleep(SEND_RETRY_DELAY)
+                else:
+                    logger.error(f"Error mengirim pesan {message_id}: {str(e)}")
+            
+            message_queue.task_done()
+        except Exception as e:
+            logger.error(f"Worker error: {str(e)}")
+
+# Mulai worker thread
+sender_thread = Thread(target=message_sender_worker, daemon=True)
+sender_thread.start()
+
+# ===================== KONFIGURASI DOMAIN & FUNGSI UTILITAS =====================
 DOMAIN_KEYWORDS = [
     'disnaker', 'tenaga kerja', 'transmigrasi', 'perindustrian',
     'kartu kuning', 'ak1', 'pelatihan', 'lowongan', 'industri',
-    'kerja', 'pencari kerja', 'phk', 'pesangon', 'bpjs ketenagakerjaan',
+    'kerja', 'pencari kerja', 'phk', 'pemecatan', 'pesangon', 
+    'hubungan industrial', 'mediasi', 'sengketa', 'bpjs ketenagakerjaan',
     'cari kerja', 'bursa kerja', 'transmigran', 'pelayanan', 'syarat',
     'jam buka', 'alamat', 'lokasi', 'kantor', 'dinas', 'bartim', 'barito timur'
 ]
@@ -43,44 +92,137 @@ DOMAIN_KEYWORDS = [
 # Penyimpanan konteks percakapan sederhana
 conversation_context = {}
 
-# ========== FUNGSI UTILITAS ==========
+def is_greeting(message):
+    """Deteksi pesan sapaan atau pembuka percakapan"""
+    greetings = [
+        'halo', 'hai', 'hi', 'pagi', 'siang', 'sore', 'malam',
+        'selamat pagi', 'selamat siang', 'selamat sore', 'selamat malam',
+        'assalamualaikum', 'salam', 'hey', 'helo'
+    ]
+    return any(greeting in message.lower() for greeting in greetings)
+
+def generate_greeting_response():
+    """Buat respons sapaan yang ramah dan natural"""
+    current_hour = datetime.utcnow().hour + 7  # WIB UTC+7
+    time_of_day = "pagi" if 5 <= current_hour < 11 else \
+                 "siang" if 11 <= current_hour < 15 else \
+                 "sore" if 15 <= current_hour < 19 else "malam"
+    
+    greetings = [
+        f"Halo! Selamat {time_of_day} 😊 Ada yang bisa saya bantu seputar DISNAKERTRANSPERIN Bartim?",
+        f"Selamat {time_of_day}! 🙏 Saya siap membantu Anda dengan informasi seputar ketenagakerjaan dan perindustrian Bartim",
+        f"Hai! Selamat {time_of_day} 😊 Ada yang bisa saya bantu hari ini?"
+    ]
+    
+    return random.choice(greetings)
+
+def is_gratitude(message):
+    """Deteksi ucapan terima kasih"""
+    gratitudes = [
+        'terima kasih', 'thanks', 'makasih', 'tengkyu', 'thx',
+        'sangat membantu', 'membantu sekali', 'terimakasih'
+    ]
+    return any(gratitude in message.lower() for gratitude in gratitudes)
+
+def generate_gratitude_response():
+    """Buat respons untuk ucapan terima kasih"""
+    responses = [
+        "Sama-sama! 😊 Senang bisa membantu. Jika ada pertanyaan lain, silakan bertanya ya!",
+        "Terima kasih kembali! 🙏 Jangan ragu hubungi kami jika butuh bantuan lebih lanjut",
+        "Dengan senang hati! 😊 Semoga informasinya bermanfaat untuk Anda"
+    ]
+    return random.choice(responses)
+
+def is_conversational(message):
+    """Deteksi pesan percakapan umum yang wajar"""
+    conversational = [
+        'baik', 'kabar', 'apa kabar', 'bagaimana', 'siapa', 'kenapa',
+        'bisa bantu', 'tolong', 'permisi', 'mohon bantuan'
+    ]
+    return any(term in message.lower() for term in conversational)
+
 def is_question_requires_web_search(question):
     """Deteksi apakah pertanyaan memerlukan pencarian web"""
     web_triggers = [
-        'jadwal', 'terbaru', 'update', 'sekarang', 'terkini', 
-        'dibuka', 'tutup', 'lokasi', 'alamat', 'tempat'
+        'lokasi', 'alamat', 'tempat', 'peta', 'maps',
+        'sharelock', 'bagikan lokasi', 'bagikan alamat',
+        'hubungan industrial', 'pemecatan', 'phk', 'pesangon',
+        'prosedur', 'tatacara', 'syarat', 'proses', 'ketentuan'
     ]
     return any(trigger in question.lower() for trigger in web_triggers)
 
-def perform_web_search(query):
-    """Lakukan pencarian web terbatas untuk info terkini"""
+def perform_web_search(query, official_only=True):
+    """Lakukan pencarian web dengan prioritas situs resmi"""
     if not WEB_SEARCH_API_KEY:
         return None
         
     try:
-        # Implementasi dengan SerpAPI
+        # Konfigurasi pencarian
         params = {
-            'q': f"site:disnakertransperin.bartimkab.go.id {query}",
+            'q': f"{query}",
             'api_key': WEB_SEARCH_API_KEY,
             'engine': 'google',
-            'num': 1
+            'num': 3,
+            'hl': 'id'
         }
         
-        response = requests.get('https://serpapi.com/search', params=params, timeout=10)
+        # Prioritisasi situs resmi
+        if official_only:
+            params['q'] += " site:disnakertransperin.bartimkab.go.id OR site:kemnaker.go.id"
+        
+        response = requests.get('https://serpapi.com/search', params=params, timeout=15)
         results = response.json()
         
         if 'organic_results' in results and results['organic_results']:
-            top_result = results['organic_results'][0]
-            return {
-                'title': top_result.get('title', ''),
-                'snippet': top_result.get('snippet', ''),
-                'link': top_result.get('link', '')
-            }
+            # Filter hasil yang relevan
+            relevant_results = [
+                r for r in results['organic_results'] 
+                if any(domain in r.get('link', '') for domain in ['disnakertransperin', 'kemnaker'])
+            ]
+            
+            # Ambil hasil terbaik
+            return relevant_results[0] if relevant_results else results['organic_results'][0]
             
     except Exception as e:
         logger.error(f"Web search error: {str(e)}")
         
     return None
+
+def extract_location_info():
+    """Info lokasi standar untuk respons cepat"""
+    return (
+        "Kantor DISNAKERTRANSPERIN Bartim:\n"
+        "📍 *Lokasi*: Jl. Tjilik Riwut KM 5, Tamiang Layang\n"
+        "🗓️ *Jam Pelayanan*: Senin-Kamis 08.00-14.00 WIB | Jumat 08.00-11.00 WIB\n"
+        "📞 *Telepon*: 0538-1234567\n"
+        f"🗺️ *Peta*: {MAPS_LOCATION}"
+    )
+
+def handle_industrial_relations(question):
+    """Penanganan khusus masalah hubungan industrial"""
+    # Cari informasi prosedur mediasi
+    web_result = perform_web_search("prosedur mediasi hubungan industrial", official_only=True)
+    
+    response = (
+        "Untuk masalah hubungan industrial seperti pemutusan hubungan kerja (PHK), "
+        "DISNAKERTRANSPERIN Bartim menyediakan layanan mediasi. Berikut langkah-langkahnya:\n\n"
+        "1. Datang ke kantor dengan membawa dokumen pendukung (surat peringatan, kontrak kerja, dll)\n"
+        "2. Isi formulir pengaduan\n"
+        "3. Tim mediasi akan memproses dalam 7 hari kerja\n"
+        "4. Mediasi akan dilaksanakan dengan melibatkan kedua belah pihak\n\n"
+    )
+    
+    if web_result:
+        response += (
+            f"Info lebih detail: {web_result.get('link', '')}\n\n"
+        )
+    
+    response += (
+        "Kami sarankan Anda segera datang ke kantor untuk konsultasi langsung. "
+        f"{extract_location_info()}"
+    )
+    
+    return response
 
 def is_too_robotic(response):
     """Deteksi apakah respon terlalu kaku/robotik"""
@@ -99,7 +241,8 @@ def rewrite_response_naturally(response, question):
     # Tambahkan sapaan jika belum ada
     if not re.search(r"(pak|bu|bapak|ibu|mas|mbak)", response, re.IGNORECASE):
         if "?" in question:
-            response = "Pak/Bu, " + response
+            prefixes = ["Pak/Bu, ", "Bapak/Ibu, ", "Saudara, "]
+            response = random.choice(prefixes) + response
     
     # Tambahkan emoji jika sesuai konteks
     positive_triggers = ["terima kasih", "selamat", "berhasil", "siap", "bisa", "informasi", "silakan"]
@@ -132,24 +275,12 @@ def should_enable_creative_mode(question):
 def is_in_domain(question):
     """Cek apakah pertanyaan relevan dengan domain DISNAKERTRANSPERIN"""
     question_lower = question.lower()
-    return any(keyword in question_lower for keyword in DOMAIN_KEYWORDS)
-
-def handle_out_of_domain(question, from_number):
-    """Tangani pertanyaan di luar domain dengan sopan"""
-    # Cek apakah ini kelanjutan percakapan
-    if from_number in conversation_context:
-        last_topic = conversation_context[from_number].get('topic', '')
-        if last_topic:
-            return (
-                f"Maaf, saya fokus pada pembahasan {last_topic}. "
-                f"Untuk pertanyaan lain, silakan hubungi kami di 0538-1234567 🙏"
-            )
     
-    return (
-        "Maaf, saya hanya bisa membantu pertanyaan seputar "
-        "Dinas Tenaga Kerja, Transmigrasi, dan Perindustrian Barito Timur (DISNAKERTRANSPERIN). "
-        "Ada yang bisa saya bantu terkait layanan kami? 😊"
-    )
+    # Jika pesan sangat pendek, beri kelonggaran
+    if len(question.split()) <= 3:
+        return True
+    
+    return any(keyword in question_lower for keyword in DOMAIN_KEYWORDS)
 
 def track_conversation_context(from_number, question, response):
     """Simpan konteks percakapan terakhir"""
@@ -169,22 +300,72 @@ def track_conversation_context(from_number, question, response):
     
     conversation_context[from_number]['topic'] = main_topic
 
-# ========== FUNGSI UTAMA GENERASI RESPONS ==========
+def handle_out_of_domain(question, from_number):
+    """Tangani pertanyaan di luar domain dengan lebih elegan"""
+    # Cek apakah ini kelanjutan percakapan
+    if from_number in conversation_context:
+        last_topic = conversation_context[from_number].get('topic', '')
+        if last_topic:
+            return (
+                f"Maaf, saya fokus pada pembahasan {last_topic}. "
+                f"Untuk pertanyaan lain, silakan hubungi kami di 0538-1234567 🙏"
+            )
+    
+    # Respons lebih ramah untuk pertanyaan umum
+    conversational_responses = [
+        "Maaf, saya khusus membantu informasi seputar Dinas Tenaga Kerja, Transmigrasi, dan Perindustrian Barito Timur. "
+        "Ada yang bisa saya bantu terkait layanan kami? 😊",
+        
+        "Saya fokus pada informasi DISNAKERTRANSPERIN Bartim. "
+        "Kalau ada pertanyaan tentang ketenagakerjaan, pelatihan, atau perindustrian, saya siap membantu! 🙏",
+        
+        "Untuk pertanyaan di luar lingkup DISNAKERTRANSPERIN, saya belum bisa bantu. "
+        "Tapi kalau ada yang ingin ditanyakan seputar layanan kami, saya dengan senang hati membantu 😊"
+    ]
+    
+    return random.choice(conversational_responses)
+
+# ===================== FUNGSI UTAMA GENERASI RESPONS =====================
 def generate_ai_response(user_message, from_number):
     """Mengirim permintaan ke Groq API dengan peningkatan baru"""
-    # Periksa perintah admin khusus
+    user_message_lower = user_message.lower()
+    
+    # 1. Tangani sapaan dengan ramah
+    if is_greeting(user_message_lower):
+        return generate_greeting_response()
+    
+    # 2. Tangani ucapan terima kasih
+    if is_gratitude(user_message_lower):
+        return generate_gratitude_response()
+    
+    # 3. Periksa perintah admin khusus
     if from_number in ADMIN_PHONES and user_message.startswith("/update "):
         new_info = user_message.replace("/update ", "")
-        # Fungsi add_update diasumsikan sudah diimplementasikan
         return f"✅ Update berhasil: {new_info}"
     
-    # 1. Cek relevansi domain
-    if not is_in_domain(user_message):
+    # 4. Tangani permintaan lokasi khusus
+    if "lokasi" in user_message_lower or "alamat" in user_message_lower or "maps" in user_message_lower:
+        return extract_location_info()
+    
+    # 5. Tangani permintaan share location
+    if "sharelock" in user_message_lower or "bagikan lokasi" in user_message_lower:
+        return (
+            f"{extract_location_info()}\n\n"
+            "Silakan klik link peta di atas untuk petunjuk arah."
+        )
+    
+    # 6. Tangani masalah hubungan industrial
+    industrial_keywords = ['phk', 'pemecatan', 'pesangon', 'hubungan industrial', 'sengketa kerja']
+    if any(kw in user_message_lower for kw in industrial_keywords):
+        return handle_industrial_relations(user_message)
+    
+    # 7. Cek relevansi domain - lebih fleksibel untuk percakapan umum
+    if not is_in_domain(user_message) and not is_conversational(user_message_lower):
         response = handle_out_of_domain(user_message, from_number)
         track_conversation_context(from_number, user_message, response)
         return response
     
-    # 2. Jawaban untuk pertanyaan umum dengan template lebih baik
+    # 8. Jawaban untuk pertanyaan umum dengan template lebih baik
     common_responses = {
         "halo": "Halo! Ada yang bisa saya bantu seputar DISNAKER Bartim? 😊",
         "jam buka": "Jam pelayanan: Senin-Kamis 08.00-14.00 WIB | Jumat 08.00-11.00 WIB",
@@ -225,37 +406,36 @@ def generate_ai_response(user_message, from_number):
     }
     
     # Cek pertanyaan umum dengan pencocokan lebih akurat
-    user_message_lower = user_message.lower()
     for keyword, response in common_responses.items():
         # Gunakan regex untuk pencocokan lebih tepat
         if re.search(r'\b' + re.escape(keyword) + r'\b', user_message_lower):
             track_conversation_context(from_number, user_message, response)
             return response
     
-    # 3. Cek apakah perlu pencarian web untuk info terkini
+    # 9. Cek apakah perlu pencarian web untuk info terkini
     if is_question_requires_web_search(user_message):
         web_result = perform_web_search(user_message)
         if web_result:
             response = (
-                f"Menurut info terbaru di website kami:\n"
-                f"{web_result['title']}\n"
-                f"{web_result['snippet']}\n"
-                f"Link: {web_result['link']}\n\n"
-                f"Info bisa berubah, silakan konfirmasi ke 0538-1234567 😊"
+                f"🔍 Berdasarkan informasi terbaru:\n"
+                f"*{web_result.get('title', 'Info terkait')}*\n"
+                f"{web_result.get('snippet', '')}\n\n"
+                f"📚 Sumber: {web_result.get('link', '')}\n\n"
+                "Info dapat berubah, silakan konfirmasi ke 0538-1234567 untuk verifikasi."
             )
             track_conversation_context(from_number, user_message, response)
             return response
     
-    # 4. Gunakan Groq AI dengan prompt yang ditingkatkan
+    # 10. Gunakan Groq AI dengan prompt yang ditingkatkan
     ai_response = query_groq(user_message)
     
-    # 5. Aktifkan mode kreatif jika diperlukan
+    # 11. Aktifkan mode kreatif jika diperlukan
     if should_enable_creative_mode(user_message):
         creative_response = generate_creative_response(user_message)
         if creative_response:
             ai_response = creative_response
     
-    # 6. Periksa dan perbaiki respon yang terlalu kaku
+    # 12. Periksa dan perbaiki respon yang terlalu kaku
     if is_too_robotic(ai_response):
         ai_response = rewrite_response_naturally(ai_response, user_message)
     
@@ -277,13 +457,12 @@ def query_groq(user_message):
         "ANDA ADALAH CUSTOMER SERVICE RESMI DISNAKERTRANSPERIN BARTIM. \n"
         "**ATURAN KETAT**:\n"
         "1. HANYA JAWAB PERTANYAAN TERKAIT TENAGA KERJA, TRANSMIGRASI, DAN PERINDUSTRIAN\n"
-        "2. BILA INGIN MEMBERI JAWABAN DI LUAR DOMAIN INI, BOLEH TAPI HARUS RELEVAN DENGAN URUSAN DISNAKERTRANSPERIN\n"
+        "2. JANGAN PERNAH MEMBERIKAN INFORMASI DI LUAR DOMAIN INI\n"
         "3. JIKA PERTANYAAN DI LUAR TOPIK, KATAKAN: 'Maaf, saya hanya bisa bantu seputar DISNAKERTRANSPERIN Bartim'\n"
         "4. UNTUK PERTANYAAN UMUM, GUNAKAN RESPONS STANDAR YANG TELAH DITENTUKAN\n"
-        "5. BILA TIDAK TAHU CARI REFERENSI DARI WEB TETAPI HARUS TETAP RELEVAN DENGAN DISNAKERTRANSPERIN\n"
+        "5. JANGAN MEMBUAT INFORMASI JIKA TIDAK TAHU\n"
         "6. GUNAKAN BAHASA INDONESIA YANG SANTUN DAN RAMAH\n"
         "7. MAKSIMAL 4 KALIMAT\n\n"
-        "8. SELALU PERTIMBANGKAN RELEVANSI DENGAN URUSAN DISNAKERTRANSPERIN, BILA TIDAK RELEVAN BERI JAWABAN YANG SOPAN AGAR CUSTOMER tetap di seputar topik dan layanan DISNAKERTRANSPERIN\n"
         "**CONTOH RESPONS YANG BENAR**:\n"
         "User: 'Apa beda AK1 dan kartu kuning?'\n"
         "Asisten: 'Kartu Kuning untuk pencari kerja pertama kali, sedangkan AK1 untuk yang pernah bekerja. Detail lengkap ada di website kami: disnakertransperin.bartimkab.go.id 😊'\n\n"
@@ -383,18 +562,19 @@ def answer_from_knowledge(user_message):
         
     return "Maaf, saya belum bisa menjawab pertanyaan tersebut. Silakan hubungi 0538-1234567 untuk bantuan lebih lanjut."
 
-# ========== ROUTE FLASK ==========
+# ===================== ROUTE FLASK =====================
 @app.route('/')
 def home():
     return jsonify({
         "status": "online",
         "service": "DISNAKER Bartim Chatbot",
-        "version": "1.2",
+        "version": "2.0",
         "features": [
+            "Natural conversation handling",
+            "Rate limit management",
             "Domain-focused responses",
-            "Natural language processing",
-            "Context-aware conversations",
-            "Web search integration"
+            "Location sharing",
+            "Industrial relations support"
         ]
     })
 
@@ -431,16 +611,15 @@ def webhook():
         # Process message
         bot_response = generate_ai_response(incoming_msg, from_number)
         
-        # Send reply
-        if twilio_client:
-            twilio_client.messages.create(
-                body=bot_response,
-                from_=TWILIO_PHONE,
-                to=f"whatsapp:{from_number}"
-            )
-            logger.info(f"Balasan terkirim ke {from_number}")
-        else:
-            logger.error("Twilio client not initialized")
+        # Masukkan ke antrian pengiriman
+        message_data = {
+            'id': str(uuid.uuid4()),
+            'to': from_number,
+            'body': bot_response,
+            'attempt': 0
+        }
+        message_queue.put(message_data)
+        logger.info(f"Pesan dimasukkan ke antrian: {message_data['id']}")
         
         return '', 200
     
