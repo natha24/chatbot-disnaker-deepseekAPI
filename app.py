@@ -1,102 +1,168 @@
 from flask import Flask, request, jsonify
 import requests
 import os
-import re
+import json
 import logging
+import re
 from datetime import datetime
+from twilio.rest import Client
+from knowledge import get_knowledge_context, load_knowledge, add_update  # Pastikan import benar
 
 app = Flask(__name__)
 
 # Konfigurasi
-ADMIN_PHONE = "6285245407566"  # Nomor admin tanpa +
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE = "whatsapp:+14155238886"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ADMIN_PHONES = json.loads(os.getenv("ADMIN_PHONES", "[]"))
+SANDBOX_CODE = os.getenv("SANDBOX_CODE", "default-code")
+
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database sementara (simpan di memory)
-message_store = {}
+# Inisialisasi klien Twilio
+try:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    logger.info("Twilio client initialized successfully")
+except Exception as e:
+    logger.error(f"Twilio init error: {str(e)}")
+    twilio_client = None
 
-@app.route('/relay', methods=['POST'])
-def relay_handler():
-    """Endpoint untuk menerima pesan dari admin (via WA Business)"""
-    try:
-        # Format: {"from": "628123456789", "text": "Pertanyaan..."}
-        data = request.json
-        sender = data['from']  # Nomor publik
-        message = data['text']
-        
-        # Simpan ke store
-        message_store[sender] = message
-        
-        # Teruskan ke Twilio sandbox
-        relay_to_twilio(sender, message)
-        
-        return jsonify({"status": "relayed"}), 200
+def generate_ai_response(user_message, from_number):
+    """Mengirim permintaan ke Groq API"""
+    # Periksa perintah admin khusus
+    if from_number in ADMIN_PHONES and user_message.startswith("/update "):
+        new_info = user_message.replace("/update ", "")
+        add_update(new_info)
+        return f"✅ Update berhasil: {new_info}"
     
-    except Exception as e:
-        logger.error(f"Relay error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+    # Jawaban untuk pertanyaan umum
+    common_responses = {
+        "halo": "Halo! Ada yang bisa saya bantu seputar DISNAKER Bartim?",
+        "jam buka": "Jam pelayanan: Senin-Kamis 08.00-14.00 WIB | Jumat 08.00-11.00 WIB",
+        "alamat": "Kantor DISNAKER Bartim: Jl. Tjilik Riwut KM 5, Tamiang Layang",
+        "kartu kuning": "Syarat kartu kuning:\n1. Fotokopi KTP\n2. Pas foto 3x4\n3. Surat pengantar kelurahan",
+        "pelatihan": "Program pelatihan gratis: Teknisi HP, Menjahit, Las, Tata Rias"
+    }
+    
+    # Cek pertanyaan umum
+    user_message_lower = user_message.lower()
+    for keyword, response in common_responses.items():
+        if keyword in user_message_lower:
+            return response
+    
+    # Gunakan Groq AI untuk pertanyaan lain
+    return query_groq(user_message)
 
-def relay_to_twilio(sender, message):
-    """Kirim pesan ke Twilio sandbox seolah dari admin"""
+def query_groq(user_message):
+    """Mengirim permintaan ke Groq API"""
+    if not GROQ_API_KEY:
+        return "Maaf, layanan AI sedang dalam pemeliharaan"
+    
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
     payload = {
-        "Body": f"{sender}: {message}",
-        "From": f"whatsapp:+{ADMIN_PHONE}",
-        "To": "whatsapp:+14155238886"  # Sandbox Twilio
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Anda asisten Dinas Tenaga Kerja Barito Timur. "
+                    "Jawab pertanyaan dengan singkat (maks 3 kalimat). "
+                    "Fokus pada layanan ketenagakerjaan. "
+                    "Jika tidak tahu, sarankan hubungi 0538-1234567."
+                )
+            },
+            {
+                "role": "user",
+                "content": user_message
+            }
+        ],
+        "model": "mixtral-8x7b-32768",
+        "temperature": 0.3,
+        "max_tokens": 256,
+        "stream": False
     }
     
     try:
         response = requests.post(
-            "https://api.twilio.com/2010-04-01/Accounts/<YOUR_TWILIO_SID>/Messages.json",
-            auth=("<TWILIO_SID>", "<TWILIO_AUTH_TOKEN>"),
-            data=payload
+            "https://api.groq.com/openai/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=10
         )
-        logger.info(f"Relay to Twilio: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data['choices'][0]['message']['content']
+        else:
+            logger.error(f"Groq API error: {response.status_code} - {response.text}")
+            return "Maaf, layanan AI sedang sibuk. Silakan coba lagi nanti."
+            
     except Exception as e:
-        logger.error(f"Twilio relay failed: {str(e)}")
+        logger.error(f"Groq API exception: {str(e)}")
+        return "Layanan informasi sedang gangguan sementara"
 
-@app.route('/webhook', methods=['POST'])
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "online",
+        "service": "DISNAKER Bartim Chatbot",
+        "version": "1.0"
+    })
+
+@app.route('/test')
+def test_endpoint():
+    return "Test endpoint working!", 200
+
+@app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
-    """Webhook untuk Twilio sandbox (seperti biasa)"""
+    """Endpoint utama untuk WhatsApp webhook"""
     try:
-        incoming_msg = request.values.get('Body', '').strip()
-        from_number = request.values.get('From', '').replace('whatsapp:', '')
+        # Handle verification request (GET)
+        if request.method == 'GET':
+            hub_mode = request.args.get('hub.mode')
+            hub_token = request.args.get('hub.verify_token')
+            hub_challenge = request.args.get('hub.challenge')
+            
+            if hub_mode == 'subscribe' and hub_token == SANDBOX_CODE:
+                return hub_challenge, 200
+            return "Verification failed", 403
         
-        # Identifikasi pesan relay dari admin
-        if from_number == ADMIN_PHONE and ':' in incoming_msg:
-            match = re.match(r'(\d+):\s*(.+)', incoming_msg)
-            if match:
-                original_sender = match.group(1)  # Nomor publik
-                original_message = match.group(2)
-                
-                # Proses dengan AI
-                bot_response = generate_ai_response(original_message)
-                
-                # Format untuk admin
-                formatted_response = f"🔔 Balas ke {original_sender}:\n{bot_response}"
-                
-                # Kirim ke admin
-                send_to_admin(formatted_response)
-                
-                return '', 200
+        # Handle incoming message (POST)
+        data = request.form
+        incoming_msg = data.get('Body', '').strip()
+        from_number = data.get('From', '').replace('whatsapp:', '')
         
-        # ... [kode bot normal lainnya] ...
+        if not incoming_msg:
+            return '', 200
+        
+        logger.info(f"Pesan masuk dari {from_number}: {incoming_msg}")
+        
+        # Process message
+        bot_response = generate_ai_response(incoming_msg, from_number)
+        
+        # Send reply
+        if twilio_client:
+            twilio_client.messages.create(
+                body=bot_response,
+                from_=TWILIO_PHONE,
+                to=f"whatsapp:{from_number}"
+            )
+            logger.info(f"Balasan terkirim ke {from_number}")
+        else:
+            logger.error("Twilio client not initialized")
+        
+        return '', 200
     
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
-def generate_ai_response(message):
-    """Generate response using Groq (sama seperti sebelumnya)"""
-    # ... [implementasi Groq] ...
-    return "Respon dari AI"
-
-def send_to_admin(message):
-    """Kirim pesan ke admin via WhatsApp Business API"""
-    # Implementasi tergantung platform WA Business
-    # Contoh menggunakan CallMeBot API (gratis)
-    try:
-        api_url = f"https://api.callmebot.com/whatsapp.php?phone={ADMIN_PHONE}&text={message}&apikey=<YOUR_API_KEY>"
-        requests.get(api_url)
-    except Exception as e:
-        logger.error(f"Failed to notify admin: {str(e)}")
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
