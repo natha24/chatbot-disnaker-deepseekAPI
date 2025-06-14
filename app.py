@@ -82,7 +82,7 @@ def query_groq(user_message):
                 "content": user_message
             }
         ],
-        "model": "mixtral-8x7b-32768",
+        "model": "llama3-70b-8192",  # Model baru pengganti
         "temperature": 0.3,
         "max_tokens": 256,
         "stream": False
@@ -100,13 +100,28 @@ def query_groq(user_message):
             data = response.json()
             return data['choices'][0]['message']['content']
         else:
-            logger.error(f"Groq API error: {response.status_code} - {response.text}")
-            return "Maaf, layanan AI sedang sibuk. Silakan coba lagi nanti."
+            # Fallback ke knowledge base jika error
+            return answer_from_knowledge(user_message)
             
-    except Exception as e:
-        logger.error(f"Groq API exception: {str(e)}")
-        return "Layanan informasi sedang gangguan sementara"
+    except Exception:
+        return "Maaf, layanan AI sedang sibuk. Silakan coba lagi nanti."
 
+def answer_from_knowledge(user_message):
+    """Fallback ke knowledge base jika Groq error"""
+    low_msg = user_message.lower()
+    
+    if "lowongan" in low_msg or "pekerjaan" in low_msg:
+        return "Info lowongan terbaru: disnakertrans.bartimkab.go.id/lowongan"
+    
+    if "layanan" in low_msg or "servis" in low_msg:
+        return (
+            "Layanan kami:\n"
+            "1. Kartu Kuning\n"
+            "2. Pelatihan Kerja\n"
+            "3. Bantuan Sosial\n"
+            "4. Mediasi Perburuhan"
+        )
+        
 @app.route('/')
 def home():
     return jsonify({
