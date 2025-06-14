@@ -98,3 +98,58 @@ def add_update(info_baru):
     # Batasi hanya 5 update terbaru
     knowledge['update_terbaru'] = knowledge['update_terbaru'][:5]
     save_knowledge(knowledge)
+
+
+# Tambahkan konfigurasi
+SANDBOX_NUMBER = "whatsapp:+14155238886"
+ADMIN_NUMBER = "whatsapp:+6285245407566"
+
+# Di dalam fungsi webhook
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        incoming_msg = request.values.get('Body', '').strip()
+        from_number = request.values.get('From', '')
+        
+        # Identifikasi apakah pesan dari admin
+        is_from_admin = from_number == ADMIN_NUMBER
+        
+        logger.info(f"Pesan dari {'ADMIN' if is_from_admin else 'USER'}: {incoming_msg}")
+        
+        # Proses pesan dari admin sebagai perintah khusus
+        if is_from_admin:
+            if incoming_msg.startswith("/"):
+                # Eksekusi perintah admin
+                bot_response = handle_admin_command(incoming_msg)
+            else:
+                # Tangani sebagai pesan biasa
+                bot_response = generate_ai_response(incoming_msg, from_number)
+        else:
+            # Tangani pesan dari pengguna biasa
+            bot_response = generate_ai_response(incoming_msg, from_number)
+        
+        # Kirim balasan
+        twilio_client.messages.create(
+            body=bot_response,
+            from_=SANDBOX_NUMBER,
+            to=from_number
+        )
+        
+        return '', 200
+    
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+def handle_admin_command(command):
+    """Tangani perintah khusus admin"""
+    if command.startswith("/update "):
+        new_info = command.replace("/update ", "")
+        add_update(new_info)
+        return f"✅ Update berhasil: {new_info}"
+    
+    elif command == "/stats":
+        return "Status: Online | Pengguna: 25"
+    
+    else:
+        return "Perintah admin tidak dikenali"
