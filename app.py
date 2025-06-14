@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import json
+import logging
 from datetime import datetime
 from twilio.rest import Client
 from knowledge import get_knowledge_context, load_knowledge, add_update
@@ -14,6 +15,14 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE = "whatsapp:+14155238886"  # Sandbox number
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 ADMIN_PHONES = json.loads(os.getenv("ADMIN_PHONES", "[]"))  # Nomor admin untuk perintah khusus
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Di dalam fungsi webhook
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        logger.info(f"Request received: {request.form}")
 
 # Inisialisasi klien Twilio
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -63,14 +72,24 @@ def generate_ai_response(user_message, from_number):
             "https://api.deepseek.com/v1/chat/completions",
             json=payload,
             headers=headers,
-            timeout=15
+            timeout=10
         )
-        response_data = response.json()
-        return response_data["choices"][0]["message"]["content"]
+         # Debug: Cetak respons API
+        print(f"DeepSeek API Response: {response.status_code} - {response.text}")
+        
+        # Perbaikan parsing respons
+        if response.status_code == 200:
+            data = response.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                return data["choices"][0]["message"]["content"]
+            else:
+                return "Maaf, saya belum bisa menjawab pertanyaan itu. Silakan hubungi 0538-1234567"
+        else:
+            return f"Maaf, terjadi kesalahan teknis (kode: {response.status_code}). Silakan coba lagi nanti."
+            
     except Exception as e:
-        print(f"Error DeepSeek API: {e}")
-        return "Maaf, sedang ada gangguan teknis. Silakan coba lagi nanti."
-
+        print(f"Error DeepSeek API: {str(e)}")
+        return "Maaf, layanan AI sedang sibuk. Silakan coba beberapa saat lagi."
 @app.route('/')
 def home():
     knowledge = load_knowledge()
