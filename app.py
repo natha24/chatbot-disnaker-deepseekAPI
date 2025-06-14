@@ -15,16 +15,12 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE = "whatsapp:+14155238886"  # Sandbox number
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 ADMIN_PHONES = json.loads(os.getenv("ADMIN_PHONES", "[]"))  # Nomor admin untuk perintah khusus
+
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Di dalam fungsi webhook
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        logger.info(f"Request received: {request.form}")
-
-# Inisialisasi klien Twilio
+# Inisialisasi klien Twilio HARUS DI SINI SEBELUM FUNGSI
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 def generate_ai_response(user_message, from_number):
@@ -64,7 +60,8 @@ def generate_ai_response(user_message, from_number):
                 "content": user_message
             }
         ],
-        "temperature": 0.3  # Kurangi kreativitas untuk akurasi lebih tinggi
+        "temperature": 0.3,  # Kurangi kreativitas untuk akurasi lebih tinggi
+        "max_tokens": 512
     }
     
     try:
@@ -72,10 +69,11 @@ def generate_ai_response(user_message, from_number):
             "https://api.deepseek.com/v1/chat/completions",
             json=payload,
             headers=headers,
-            timeout=10
+            timeout=15
         )
-         # Debug: Cetak respons API
-        print(f"DeepSeek API Response: {response.status_code} - {response.text}")
+        
+        # Debug: Cetak respons API
+        logger.info(f"DeepSeek API Response: {response.status_code} - {response.text}")
         
         # Perbaikan parsing respons
         if response.status_code == 200:
@@ -88,8 +86,9 @@ def generate_ai_response(user_message, from_number):
             return f"Maaf, terjadi kesalahan teknis (kode: {response.status_code}). Silakan coba lagi nanti."
             
     except Exception as e:
-        print(f"Error DeepSeek API: {str(e)}")
+        logger.error(f"Error DeepSeek API: {str(e)}")
         return "Maaf, layanan AI sedang sibuk. Silakan coba beberapa saat lagi."
+
 @app.route('/')
 def home():
     knowledge = load_knowledge()
@@ -101,6 +100,7 @@ def home():
         }
     })
 
+# HANYA SATU FUNGSI webhook!
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
@@ -108,7 +108,7 @@ def webhook():
         incoming_msg = request.values.get('Body', '').strip()
         from_number = request.values.get('From', '').replace('whatsapp:', '')
         
-        print(f"Pesan masuk dari {from_number}: {incoming_msg}")
+        logger.info(f"Pesan masuk dari {from_number}: {incoming_msg}")
         
         # Lewati pesan kosong
         if not incoming_msg:
@@ -127,7 +127,7 @@ def webhook():
         return '', 200
     
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
