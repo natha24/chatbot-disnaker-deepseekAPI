@@ -23,6 +23,10 @@ WEB_SEARCH_API_KEY = os.getenv("WEB_SEARCH_API_KEY")  # API key untuk layanan pe
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.info(f"Twilio configured: {bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)}")
+logger.info(f"GROQ API configured: {bool(GROQ_API_KEY)}")
+logger.info(f"Admin phones: {ADMIN_PHONES}")
+
 
 # Inisialisasi klien Twilio
 try:
