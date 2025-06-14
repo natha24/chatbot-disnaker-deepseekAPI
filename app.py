@@ -13,46 +13,61 @@ app = Flask(__name__)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE = "whatsapp:+14155238886"  # Sandbox number
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-ADMIN_PHONES = json.loads(os.getenv("ADMIN_PHONES", "[]"))  # Nomor admin untuk perintah khusus
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # Ganti ke Groq
+ADMIN_PHONES = json.loads(os.getenv("ADMIN_PHONES", "[]"))
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Inisialisasi klien Twilio HARUS DI SINI SEBELUM FUNGSI
+# Inisialisasi klien Twilio
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 def generate_ai_response(user_message, from_number):
-    """Mengirim permintaan ke DeepSeek API dengan konteks knowledge base"""
-    knowledge_context = get_knowledge_context()
-    
+    """Mengirim permintaan ke Groq API"""
     # Periksa perintah admin khusus
     if from_number in ADMIN_PHONES and user_message.startswith("/update "):
         new_info = user_message.replace("/update ", "")
         add_update(new_info)
         return f"✅ Update berhasil ditambahkan: {new_info}"
     
+    # Coba knowledge base dulu
+    knowledge_context = get_knowledge_context()
+    low_msg = user_message.lower()
+    
+    # Jawab pertanyaan umum dari knowledge base
+    common_questions = {
+        "halo": "Halo! Ada yang bisa saya bantu seputar layanan DISNAKER Bartim?",
+        "jam buka": "Jam pelayanan: Senin-Kamis 08.00-14.00 WIB | Jumat 08.00-11.00 WIB",
+        "alamat": "Kantor DISNAKER Bartim: Jl. Tjilik Riwut KM 5, Tamiang Layang",
+        "kartu kuning": "Syarat kartu kuning:\n1. Fotokopi KTP\n2. Pas foto 3x4\n3. Surat pengantar kelurahan",
+        "pelatihan": "Program pelatihan gratis: Teknisi HP, Menjahit, Las, Tata Rias",
+        "kontak": "Hubungi kami:\n📞 0538-1234567\n✉️ diskertrans.bartim@gmail.com"
+    }
+    
+    for keyword, response in common_questions.items():
+        if keyword in low_msg:
+            return response
+    
+    # Jika tidak ada di knowledge base, gunakan Groq AI
+    return query_groq(user_message)
+
+def query_groq(user_message):
+    """Mengirim permintaan ke Groq API"""
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
     
     payload = {
-        "model": "deepseek-chat",
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "Anda adalah asisten virtual Dinas Tenaga Kerja Barito Timur (DISNAKER Bartim). "
-                    "Gunakan informasi resmi berikut untuk menjawab pertanyaan:\n\n"
-                    f"{knowledge_context}\n\n"
-                    "PETUNJUK:\n"
-                    "1. Gunakan Bahasa Indonesia yang formal dan sopan\n"
-                    "2. Fokus pada layanan ketenagakerjaan di Kabupaten Barito Timur\n"
-                    "3. Jika pertanyaan di luar cakupan, sarankan untuk menghubungi kontak resmi\n"
-                    "4. Jangan mengarang informasi yang tidak ada dalam knowledge base\n"
-                    "5. Untuk pertanyaan umum, gunakan knowledge base sebagai referensi utama"
+                    "Anda adalah asisten virtual Dinas Tenaga Kerja Barito Timur. "
+                    "Jawab pertanyaan dengan singkat (maks 3 kalimat). "
+                    "Fokus pada layanan ketenagakerjaan. "
+                    "Jika tidak tahu, sarankan hubungi 0538-1234567."
                 )
             },
             {
@@ -60,47 +75,46 @@ def generate_ai_response(user_message, from_number):
                 "content": user_message
             }
         ],
-        "temperature": 0.3,  # Kurangi kreativitas untuk akurasi lebih tinggi
-        "max_tokens": 512
+        "model": "mixtral-8x7b-32768",  # Model gratis terbaik
+        "temperature": 0.3,
+        "max_tokens": 256,
+        "stream": False
     }
     
     try:
         response = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
+            "https://api.groq.com/openai/v1/chat/completions",
             json=payload,
             headers=headers,
             timeout=15
         )
         
-        # Debug: Cetak respons API
-        logger.info(f"DeepSeek API Response: {response.status_code} - {response.text}")
+        logger.info(f"Groq API Response: {response.status_code} - {response.text}")
         
-        # Perbaikan parsing respons
         if response.status_code == 200:
             data = response.json()
-            if "choices" in data and len(data["choices"]) > 0:
-                return data["choices"][0]["message"]["content"]
-            else:
-                return "Maaf, saya belum bisa menjawab pertanyaan itu. Silakan hubungi 0538-1234567"
+            return data['choices'][0]['message']['content']
+        elif response.status_code == 429:
+            return "Maaf, layanan AI sedang sibuk. Silakan coba lagi sebentar."
         else:
-            return f"Maaf, terjadi kesalahan teknis (kode: {response.status_code}). Silakan coba lagi nanti."
+            return "Maaf, terjadi kesalahan teknis. Silakan hubungi 0538-1234567."
             
     except Exception as e:
-        logger.error(f"Error DeepSeek API: {str(e)}")
-        return "Maaf, layanan AI sedang sibuk. Silakan coba beberapa saat lagi."
+        logger.error(f"Groq API Error: {str(e)}")
+        return "Layanan informasi sedang gangguan. Silakan coba lagi nanti."
 
 @app.route('/')
 def home():
     knowledge = load_knowledge()
     return jsonify({
         "status": "online",
+        "provider": "Groq AI",
         "last_updated": datetime.now().isoformat(),
         "knowledge_stats": {
             "updates_count": len(knowledge['update_terbaru'])
         }
     })
 
-# HANYA SATU FUNGSI webhook!
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
@@ -114,7 +128,7 @@ def webhook():
         if not incoming_msg:
             return '', 200
             
-        # Dapatkan respon dari AI
+        # Dapatkan respon
         bot_response = generate_ai_response(incoming_msg, from_number)
         
         # Kirim balasan
