@@ -275,5 +275,5 @@ def generate_creative_response(user_message):
 # (answer_from_knowledge, home, test_endpoint, webhook)
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 8080))  # Default ke 8080 jika tidak ada env var
     app.run(host='0.0.0.0', port=port)
