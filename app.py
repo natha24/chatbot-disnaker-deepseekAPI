@@ -245,7 +245,7 @@ def generate_creative_response(user_message):
             "3. Sertakan pertanyaan lanjutan untuk merangsang pemikiran "
             "4. Tetap akurat secara informasi "
             "5. Maksimal 4 kalimat"
-            "6. untuk pertanyaan yang tidak ada di base knowladge, tetapi berkaitan dengan disnakertransperin bisa di cari referensinya dari internet"
+            
         )
         
         payload = {
