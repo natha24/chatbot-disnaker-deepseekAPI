@@ -1,155 +1,102 @@
-import json
+from flask import Flask, request, jsonify
+import requests
 import os
+import re
+import logging
+from datetime import datetime
 
-KNOWLEDGE_FILE = "knowledge.json"
+app = Flask(__name__)
 
-# Di fungsi cari_jawaban()
-def cari_jawaban(pertanyaan):
-    pertanyaan = pertanyaan.lower()
-    
-    # Pertanyaan sangat umum
-    if any(k in pertanyaan for k in ["halo", "hai", "pagi", "siang"]):
-        return "Halo! Ada yang bisa saya bantu seputar layanan DISNAKER Bartim?"
-    
-    if "jam buka" in pertanyaan:
-        return "Jam pelayanan: Senin-Kamis 08.00-14.00 WIB | Jumat 08.00-11.00 WIB"
+# Konfigurasi
+ADMIN_PHONE = "6285245407566"  # Nomor admin tanpa +
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def load_knowledge():
-    """Memuat knowledge base dari file JSON"""
-    if not os.path.exists(KNOWLEDGE_FILE):
-        # Inisialisasi knowledge base default
-        default_knowledge = {
-            "info_dinas": {
-                "jam_operasional": "Senin-Kamis: 08.00-14.00 WIB | Jumat: 08.00-11.00 WIB",
-                "alamat": "Jl. Tjilik Riwut KM 5, Tamiang Layang, Kalimantan Tengah",
-                "kontak": "0538-1234567 | diskertrans.bartim@gmail.com"
-            },
-            "layanan": {
-                "kartu_kuning": {
-                    "syarat": [
-                        "Fotokopi KTP",
-                        "Pas foto 3x4 (latar merah)",
-                        "Surat pengantar dari kelurahan",
-                        "Ijazah terakhir yang dilegalisir"
-                    ],
-                    "prosedur": "Datang ke kantor DISNAKER Bartim dengan membawa persyaratan lengkap"
-                },
-                "pelatihan": {
-                    "jenis": ["Teknisi HP", "Menenun", "Las Dasar", "Tata Rias"],
-                    "pendaftaran": "Via WhatsApp ini atau langsung ke kantor"
-                }
-            },
-            "update_terbaru": []
-        }
-        save_knowledge(default_knowledge)
-    
-    with open(KNOWLEDGE_FILE, 'r') as f:
-        return json.load(f)
+# Database sementara (simpan di memory)
+message_store = {}
 
-def save_knowledge(data):
-    """Menyimpan knowledge base ke file JSON"""
-    with open(KNOWLEDGE_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-def get_knowledge_context():
-    """Mengembalikan konteks knowledge base untuk prompt AI"""
-    knowledge = load_knowledge()
-    context = """
-# INFORMASI RESMI DISNAKER BARITO TIMUR
-## Informasi Umum
-- Jam Operasional: {jam_operasional}
-- Alamat: {alamat}
-- Kontak: {kontak}
-
-## Layanan Unggulan
-### Kartu Kuning (AK-1)
-**Syarat:**
-{list_syarat_kartu_kuning}
-
-**Prosedur:**
-{kartu_kuning_prosedur}
-
-### Program Pelatihan
-**Jenis Pelatihan:**
-{list_jenis_pelatihan}
-
-**Pendaftaran:**
-{pelatihan_pendaftaran}
-
-## Update Terbaru
-{list_update_terbaru}
-""".format(
-        jam_operasional=knowledge['info_dinas']['jam_operasional'],
-        alamat=knowledge['info_dinas']['alamat'],
-        kontak=knowledge['info_dinas']['kontak'],
-        list_syarat_kartu_kuning="\n".join([f"- {s}" for s in knowledge['layanan']['kartu_kuning']['syarat']]),
-        kartu_kuning_prosedur=knowledge['layanan']['kartu_kuning']['prosedur'],
-        list_jenis_pelatihan="\n".join([f"- {j}" for j in knowledge['layanan']['pelatihan']['jenis']]),
-        pelatihan_pendaftaran=knowledge['layanan']['pelatihan']['pendaftaran'],
-        list_update_terbaru="\n".join([f"- {u}" for u in knowledge['update_terbaru']]) if knowledge['update_terbaru'] else "Tidak ada update terbaru"
-    )
-    return context
-
-def add_update(info_baru):
-    """Menambahkan update baru ke knowledge base"""
-    knowledge = load_knowledge()
-    knowledge['update_terbaru'].insert(0, f"{info_baru} [Ditambahkan pada: {datetime.now().strftime('%d/%m/%Y')}]")
-    
-    # Batasi hanya 5 update terbaru
-    knowledge['update_terbaru'] = knowledge['update_terbaru'][:5]
-    save_knowledge(knowledge)
-
-
-# Tambahkan konfigurasi
-SANDBOX_NUMBER = "whatsapp:+14155238886"
-ADMIN_NUMBER = "whatsapp:+6285245407566"
-
-# Di dalam fungsi webhook
-@app.route('/webhook', methods=['POST'])
-def webhook():
+@app.route('/relay', methods=['POST'])
+def relay_handler():
+    """Endpoint untuk menerima pesan dari admin (via WA Business)"""
     try:
-        incoming_msg = request.values.get('Body', '').strip()
-        from_number = request.values.get('From', '')
+        # Format: {"from": "628123456789", "text": "Pertanyaan..."}
+        data = request.json
+        sender = data['from']  # Nomor publik
+        message = data['text']
         
-        # Identifikasi apakah pesan dari admin
-        is_from_admin = from_number == ADMIN_NUMBER
+        # Simpan ke store
+        message_store[sender] = message
         
-        logger.info(f"Pesan dari {'ADMIN' if is_from_admin else 'USER'}: {incoming_msg}")
+        # Teruskan ke Twilio sandbox
+        relay_to_twilio(sender, message)
         
-        # Proses pesan dari admin sebagai perintah khusus
-        if is_from_admin:
-            if incoming_msg.startswith("/"):
-                # Eksekusi perintah admin
-                bot_response = handle_admin_command(incoming_msg)
-            else:
-                # Tangani sebagai pesan biasa
-                bot_response = generate_ai_response(incoming_msg, from_number)
-        else:
-            # Tangani pesan dari pengguna biasa
-            bot_response = generate_ai_response(incoming_msg, from_number)
-        
-        # Kirim balasan
-        twilio_client.messages.create(
-            body=bot_response,
-            from_=SANDBOX_NUMBER,
-            to=from_number
-        )
-        
-        return '', 200
+        return jsonify({"status": "relayed"}), 200
     
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Relay error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-def handle_admin_command(command):
-    """Tangani perintah khusus admin"""
-    if command.startswith("/update "):
-        new_info = command.replace("/update ", "")
-        add_update(new_info)
-        return f"✅ Update berhasil: {new_info}"
+def relay_to_twilio(sender, message):
+    """Kirim pesan ke Twilio sandbox seolah dari admin"""
+    payload = {
+        "Body": f"{sender}: {message}",
+        "From": f"whatsapp:+{ADMIN_PHONE}",
+        "To": "whatsapp:+14155238886"  # Sandbox Twilio
+    }
     
-    elif command == "/stats":
-        return "Status: Online | Pengguna: 25"
+    try:
+        response = requests.post(
+            "https://api.twilio.com/2010-04-01/Accounts/<YOUR_TWILIO_SID>/Messages.json",
+            auth=("<TWILIO_SID>", "<TWILIO_AUTH_TOKEN>"),
+            data=payload
+        )
+        logger.info(f"Relay to Twilio: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Twilio relay failed: {str(e)}")
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Webhook untuk Twilio sandbox (seperti biasa)"""
+    try:
+        incoming_msg = request.values.get('Body', '').strip()
+        from_number = request.values.get('From', '').replace('whatsapp:', '')
+        
+        # Identifikasi pesan relay dari admin
+        if from_number == ADMIN_PHONE and ':' in incoming_msg:
+            match = re.match(r'(\d+):\s*(.+)', incoming_msg)
+            if match:
+                original_sender = match.group(1)  # Nomor publik
+                original_message = match.group(2)
+                
+                # Proses dengan AI
+                bot_response = generate_ai_response(original_message)
+                
+                # Format untuk admin
+                formatted_response = f"🔔 Balas ke {original_sender}:\n{bot_response}"
+                
+                # Kirim ke admin
+                send_to_admin(formatted_response)
+                
+                return '', 200
+        
+        # ... [kode bot normal lainnya] ...
     
-    else:
-        return "Perintah admin tidak dikenali"
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+def generate_ai_response(message):
+    """Generate response using Groq (sama seperti sebelumnya)"""
+    # ... [implementasi Groq] ...
+    return "Respon dari AI"
+
+def send_to_admin(message):
+    """Kirim pesan ke admin via WhatsApp Business API"""
+    # Implementasi tergantung platform WA Business
+    # Contoh menggunakan CallMeBot API (gratis)
+    try:
+        api_url = f"https://api.callmebot.com/whatsapp.php?phone={ADMIN_PHONE}&text={message}&apikey=<YOUR_API_KEY>"
+        requests.get(api_url)
+    except Exception as e:
+        logger.error(f"Failed to notify admin: {str(e)}")
